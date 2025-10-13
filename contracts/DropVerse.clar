@@ -7,14 +7,15 @@
   total: uint, 
   start: uint, 
   end: uint, 
-  claimed: uint 
+  claimed-count: uint,
+  distributed: uint 
 })
 
 ;; Track claimed addresses to prevent duplicate claims
 (define-map claimed-addresses { airdrop-id: uint, address: principal } bool)
 
 ;; Contract owner for administrative functions
-(define-constant contract-owner tx-sender)
+(define-data-var contract-owner (optional principal) none)
 
 ;; Error codes
 (define-constant ERR-NOT-AUTHORIZED (err u100))
@@ -26,41 +27,60 @@
 (define-constant ERR-INVALID-TOTAL (err u106))
 (define-constant ERR-INVALID-TIME-RANGE (err u107))
 (define-constant ERR-INVALID-AMOUNT (err u108))
+(define-constant ERR-OWNER-NOT-SET (err u109))
+(define-constant ERR-OWNER-ALREADY-SET (err u110))
+(define-constant ZERO-ROOT 0x0000000000000000000000000000000000000000000000000000000000000000)
+(define-constant ZERO-LEAF ZERO-ROOT)
 
-;; Helper function to extract claim amount from proof
-;; In production, this should properly decode the proof structure
-(define-private (get-claim-amount (proof (buff 64)))
-  ;; For now, return a fixed amount since proof parsing is complex
-  ;; In production, this would properly decode the amount from the proof
-  u1000000) ;; 1 STX in microSTX
+;; Helper to return the contract principal
+(define-private (contract-self)
+  (as-contract tx-sender))
+
+;; Assert that the caller is the registered contract owner
+(define-private (assert-contract-owner)
+  (match (var-get contract-owner)
+    owner-principal
+      (if (is-eq tx-sender owner-principal)
+          (ok true)
+          ERR-NOT-AUTHORIZED)
+      ERR-OWNER-NOT-SET))
 
 ;; Create leaf hash from address and amount for Merkle tree
-;; Simplified version that avoids buffer concatenation issues
 (define-private (create-leaf (address principal) (amount uint))
-  ;; Create a simple deterministic hash using the address directly
-  ;; In production, this would follow the exact Merkle tree leaf format
-  ;; For now, we'll use a combination of hashes to create uniqueness
-  (let ((addr-hash (hash160 (unwrap! (to-consensus-buff? address) 0x00))))
-    ;; Combine with amount by XORing with amount's hash
-    (hash160 (concat addr-hash (unwrap! (to-consensus-buff? amount) 0x00)))))
+  (let (
+        (addr-hash (hash160 (unwrap! (to-consensus-buff? address) 0x00)))
+        (amount-hash (sha256 (unwrap! (to-consensus-buff? amount) 0x00))))
+    (sha256 (concat addr-hash amount-hash))))
+
+;; Reduce a Merkle path to a root
+(define-private (apply-sibling (segment (tuple (hash (buff 32)) (left bool))) (running (buff 32)))
+  (let ((sibling (get hash segment)))
+    (if (get left segment)
+        (sha256 (concat sibling running))
+        (sha256 (concat running sibling)))))
 
 ;; Simplified Merkle proof verification
-;; In production, this should implement full Merkle tree verification
-(define-private (verify-merkle-proof (leaf (buff 20)) (proof (buff 64)) (root (buff 32)))
-  ;; This is a placeholder - real implementation would:
-  ;; 1. Split proof into sibling hashes
-  ;; 2. Reconstruct path to root by hashing leaf with siblings
-  ;; 3. Compare final hash with stored root
-  ;; For now, we'll do a basic non-zero check
-  (and 
-    (not (is-eq leaf 0x0000000000000000000000000000000000000000))
-    (not (is-eq root 0x0000000000000000000000000000000000000000000000000000000000000000))))
+;; Ensures proof length aligns with 32-byte sibling hashes
+(define-private (verify-merkle-proof (leaf (buff 32)) (path (list 16 (tuple (hash (buff 32)) (left bool)))) (root (buff 32)))
+  (let ((computed (fold apply-sibling path leaf)))
+    (and
+      (not (is-eq leaf ZERO-LEAF))
+      (not (is-eq root ZERO-ROOT))
+      (<= (len path) u16)
+      (is-eq root computed))))
+
+;; One-time owner initialization
+(define-public (initialize-owner)
+  (begin
+    (asserts! (is-none (var-get contract-owner)) ERR-OWNER-ALREADY-SET)
+    (var-set contract-owner (some tx-sender))
+    (ok true)))
 
 ;; Administrative function to schedule a new airdrop
 (define-public (schedule-airdrop (id uint) (root (buff 32)) (total uint) (start uint) (end uint))
   (begin
     ;; Only contract owner can schedule airdrops
-    (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+    (try! (assert-contract-owner))
     ;; Ensure valid parameters
     (asserts! (> total u0) ERR-INVALID-TOTAL)
     (asserts! (< start end) ERR-INVALID-TIME-RANGE)
@@ -70,14 +90,16 @@
       total: total, 
       start: start, 
       end: end, 
-      claimed: u0 
+      claimed-count: u0,
+      distributed: u0 
     })
     (ok true)))
 
 ;; Main claim function for users to claim their airdrop tokens
-(define-public (claim (airdrop-id uint) (proof (buff 64)) (amount uint))
-  (let ((airdrop-data (map-get? airdrops airdrop-id))
-        (claim-key { airdrop-id: airdrop-id, address: tx-sender }))
+(define-public (claim (airdrop-id uint) (proof (list 16 (tuple (hash (buff 32)) (left bool)))) (amount uint))
+  (let ((recipient tx-sender)
+        (airdrop-data (map-get? airdrops airdrop-id))
+        (claim-key { airdrop-id: airdrop-id, address: recipient }))
     (match airdrop-data
       airdrop-info
         (begin
@@ -92,25 +114,29 @@
           
           ;; Ensure amount is greater than zero
           (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-          
-          ;; Create leaf for verification
-          (let ((leaf (create-leaf tx-sender amount)))
+
+          (let ((leaf (create-leaf recipient amount))
+                (new-distributed (+ (get distributed airdrop-info) amount))
+                (contract-balance (stx-get-balance (contract-self))))
             ;; Verify Merkle proof
             (asserts! (verify-merkle-proof leaf proof (get root airdrop-info)) ERR-INVALID-PROOF)
+            (asserts! (<= new-distributed (get total airdrop-info)) ERR-INSUFFICIENT-BALANCE)
+            (asserts! (<= amount contract-balance) ERR-INSUFFICIENT-BALANCE)
             
             ;; Mark address as claimed
             (map-set claimed-addresses claim-key true)
             
             ;; Transfer tokens from contract to claimant
-            (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+            (try! (as-contract (stx-transfer? amount tx-sender recipient)))
             
-            ;; Update claimed count
+            ;; Update claimed metrics
             (map-set airdrops airdrop-id { 
               root: (get root airdrop-info), 
               total: (get total airdrop-info), 
               start: (get start airdrop-info), 
               end: (get end airdrop-info), 
-              claimed: (+ (get claimed airdrop-info) u1) 
+              claimed-count: (+ (get claimed-count airdrop-info) u1),
+              distributed: new-distributed 
             })
             
             (ok true)))
@@ -119,8 +145,8 @@
 ;; Function to fund the contract with STX for airdrops
 (define-public (fund-contract (amount uint))
   (begin
-    (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
-    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (try! (assert-contract-owner))
+    (try! (stx-transfer? amount tx-sender (contract-self)))
     (ok true)))
 
 ;; Read-only function to check if an address has claimed from an airdrop
@@ -142,10 +168,10 @@
 
 ;; Read-only function to get contract balance
 (define-read-only (get-contract-balance)
-  (stx-get-balance (as-contract tx-sender)))
+  (stx-get-balance (contract-self)))
 
 ;; Read-only function to get total claims for an airdrop
 (define-read-only (get-total-claims (airdrop-id uint))
   (match (map-get? airdrops airdrop-id)
-    airdrop-info (get claimed airdrop-info)
+    airdrop-info (get claimed-count airdrop-info)
     u0))
