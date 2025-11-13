@@ -8,7 +8,8 @@
   start: uint, 
   end: uint, 
   claimed-count: uint,
-  distributed: uint 
+  distributed: uint,
+  finalized: bool 
 })
 
 ;; Track claimed addresses to prevent duplicate claims
@@ -29,6 +30,9 @@
 (define-constant ERR-INVALID-AMOUNT (err u108))
 (define-constant ERR-OWNER-NOT-SET (err u109))
 (define-constant ERR-OWNER-ALREADY-SET (err u110))
+(define-constant ERR-AIRDROP-EXISTS (err u111))
+(define-constant ERR-AIRDROP-FINALIZED (err u112))
+(define-constant ERR-AIRDROP-ACTIVE (err u113))
 (define-constant ZERO-ROOT 0x0000000000000000000000000000000000000000000000000000000000000000)
 (define-constant ZERO-LEAF ZERO-ROOT)
 
@@ -84,6 +88,7 @@
     ;; Ensure valid parameters
     (asserts! (> total u0) ERR-INVALID-TOTAL)
     (asserts! (< start end) ERR-INVALID-TIME-RANGE)
+    (asserts! (is-none (map-get? airdrops id)) ERR-AIRDROP-EXISTS)
     ;; Store airdrop data
     (map-set airdrops id { 
       root: root, 
@@ -91,7 +96,8 @@
       start: start, 
       end: end, 
       claimed-count: u0,
-      distributed: u0 
+      distributed: u0,
+      finalized: false 
     })
     (ok true)))
 
@@ -108,6 +114,9 @@
             (>= stacks-block-height (get start airdrop-info)) 
             (<= stacks-block-height (get end airdrop-info))) 
             ERR-INVALID-TIMING)
+          
+          ;; Ensure airdrop has not been finalized
+          (asserts! (not (get finalized airdrop-info)) ERR-AIRDROP-FINALIZED)
           
           ;; Check if user has already claimed
           (asserts! (is-none (map-get? claimed-addresses claim-key)) ERR-ALREADY-CLAIMED)
@@ -136,11 +145,38 @@
               start: (get start airdrop-info), 
               end: (get end airdrop-info), 
               claimed-count: (+ (get claimed-count airdrop-info) u1),
-              distributed: new-distributed 
+              distributed: new-distributed,
+              finalized: (get finalized airdrop-info) 
             })
             
             (ok true)))
       ERR-AIRDROP-NOT-FOUND)))
+
+;; Finalize an airdrop after it ends and recover unclaimed STX
+(define-public (finalize-airdrop (airdrop-id uint))
+  (begin
+    (try! (assert-contract-owner))
+    (let ((owner tx-sender))
+      (match (map-get? airdrops airdrop-id)
+        airdrop-info
+          (begin
+            (asserts! (not (get finalized airdrop-info)) ERR-AIRDROP-FINALIZED)
+            (asserts! (> stacks-block-height (get end airdrop-info)) ERR-AIRDROP-ACTIVE)
+            (let ((unclaimed (- (get total airdrop-info) (get distributed airdrop-info))))
+              (if (> unclaimed u0)
+                  (try! (as-contract (stx-transfer? unclaimed tx-sender owner)))
+                  true))
+            (map-set airdrops airdrop-id { 
+              root: (get root airdrop-info), 
+              total: (get total airdrop-info), 
+              start: (get start airdrop-info), 
+              end: (get end airdrop-info), 
+              claimed-count: (get claimed-count airdrop-info),
+              distributed: (get distributed airdrop-info),
+              finalized: true 
+            })
+            (ok true))
+        ERR-AIRDROP-NOT-FOUND))))
 
 ;; Function to fund the contract with STX for airdrops
 (define-public (fund-contract (amount uint))
